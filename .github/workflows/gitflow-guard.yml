@@ -12,4 +12,4 @@ on:
 
 jobs:
   gitflow-guard:
-    uses: JMNZ-Technologies/shared/.github/workflows/gitflow-guard.yml@main
+    uses: JIMIX-Technologies/shared/.github/workflows/gitflow-guard.yml@main

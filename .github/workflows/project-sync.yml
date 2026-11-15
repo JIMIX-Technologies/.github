@@ -23,7 +23,7 @@ jobs:
     # run dies at startup on every issue event, fleet-wide (orchestrator#269).
     permissions:
       issues: read
-    uses: JMNZ-Technologies/shared/.github/workflows/project-sync.yml@main
+    uses: JIMIX-Technologies/shared/.github/workflows/project-sync.yml@main
     with:
       project_number: 1 # <-- replace with the number setup-project-board.sh prints
     secrets: inherit
