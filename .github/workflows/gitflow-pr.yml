@@ -1,0 +1,19 @@
+# Thin caller — drop into EACH repo at .github/workflows/gitflow-pr.yml (rolled out fleet-wide by
+# `make standardize-all`, see scripts/fleet-standard-files.yml). Branch-prefix rule, Conventional
+# Commits, and auto-merge with the gitflow merge method; the required check is
+# `gitflow-pr / gitflow-pr`. All logic lives in the shared reusable workflow. See
+# docs/guidelines/GIT-WORKFLOW.md (central docs repo).
+#
+# `secrets: inherit` hands the fleet-writer App secrets to the auto-merge job: auto-merge enabled
+# with GITHUB_TOKEN would merge without triggering release/build/deploy.
+name: gitflow-pr
+
+on:
+  pull_request:
+    branches: [main, development]
+    types: [opened, reopened, ready_for_review, synchronize]
+
+jobs:
+  gitflow-pr:
+    uses: JIMIX-Technologies/shared/.github/workflows/gitflow-pr.yml@main
+    secrets: inherit

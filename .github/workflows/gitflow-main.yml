@@ -1,0 +1,19 @@
+# Thin caller — drop into EACH repo at .github/workflows/gitflow-main.yml (rolled out fleet-wide by
+# `make standardize-all`). Back-merges main's tip into development through an auto-merging
+# `backmerge/v<version>` PR. The v* tag trigger is the normal path: the release merge pushes main
+# first and release.yml tags it minutes later. All logic lives in the shared reusable workflow.
+name: gitflow-main
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  # Daily: alerts on a back-merge PR open for more than 24h (it blocks the next release).
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+
+jobs:
+  gitflow-main:
+    uses: JIMIX-Technologies/shared/.github/workflows/gitflow-main.yml@main
+    secrets: inherit
