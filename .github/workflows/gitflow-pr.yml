@@ -1,0 +1,238 @@
+# Self-contained gitflow-pr for PUBLIC repos — drop into .github/workflows/gitflow-pr.yml (rolled
+# out by `make standardize-all` to every group holding a public repo, see
+# scripts/fleet-standard-files.yml). Private repos use the thin caller
+# github-gitflow-pr-caller.yml instead.
+#
+# Why a copy: a public repo cannot call a reusable workflow or action from the PRIVATE `shared`
+# repo (the run fails at startup with 0 jobs: .github's gitflow-guard did so on every PR from
+# 2026-09-20), and the Homelab runner group does not allow public repos. So this file references
+# none of the org's private actions or workflows, runs on GitHub-hosted runners (free for public
+# repos, and a fork PR never reaches a homelab runner), and SHA-pins its actions (ADR-046).
+#
+# ONE SOURCE: every step below that shares a name with a step of shared
+# .github/workflows/gitflow-pr.yml is a verbatim copy of it. tests/guards/gitflow-public.spec.ts
+# fails when they diverge (it reads shared from the fleet clone that fleet-gates makes), so edit
+# shared first and copy the step here. What differs on purpose:
+#   - no prepare-release: the public repos have no package.json or releases (add it back, and
+#     gitflow-main for the back-merge, only if one ever gets a release flow);
+#   - the required check is this file's aggregate job, context `gitflow-pr` (orchestrator
+#     terraform/github/variables.tf family `public`), not `gitflow-pr / gitflow-pr`;
+#   - the App credentials come straight from the org (visibility "all" reaches public repos),
+#     without the pre-OpenBao `FLEET_WRITE_APP_*` fallbacks.
+name: gitflow-pr
+
+on:
+  pull_request:
+    branches: [main, development]
+    types: [opened, reopened, ready_for_review, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitflow-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  branch-rules:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0 # ancestry of origin/main
+
+      # Branch names reach the script through env, never `${{ }}` inside `run:`: a head ref such
+      # as `feature/$(curl…|sh)` is a valid git ref and would otherwise execute on the runner.
+      - name: Validate source branch against target's allowed prefixes
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          case "$BASE_REF" in
+            main) allowed='^(release|hotfix)/' ;;
+            # backmerge/: the automatic back-merge of main (gitflow-main.yml). Never `main` itself.
+            development) allowed='^(feature|fix|chore|docs|ci|release|hotfix|renovate|backmerge)/' ;;
+            *)
+              echo "Target '$BASE_REF' is not main/development — branch-prefix rule does not apply, skipping."
+              exit 0
+              ;;
+          esac
+          if ! echo "$HEAD_REF" | grep -qE "$allowed"; then
+            echo "::error::Branch '$HEAD_REF' cannot merge into '$BASE_REF'. Allowed for '$BASE_REF': $allowed"
+            echo "See docs/guidelines/GIT-WORKFLOW.md in the central docs repo."
+            exit 1
+          fi
+          echo "OK: '$HEAD_REF' -> '$BASE_REF' is an allowed gitflow merge."
+
+      - name: Release/hotfix contains main
+        if: github.event.pull_request.base.ref == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --quiet origin main
+          if git merge-base --is-ancestor origin/main "$HEAD_SHA"; then
+            echo "OK: the branch contains main ($(git rev-parse --short origin/main))."
+            exit 0
+          fi
+          # The PR number needs pull-requests:read, which a caller may not grant; the branch name
+          # is always available.
+          pending="$(gh pr list -R "$REPO" --base development --state open --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("backmerge/")) | "#\(.number) (\(.headRefName))"' 2> /dev/null | head -n1 || true)"
+          if [ -z "$pending" ]; then
+            pending="$(git ls-remote --heads origin 'backmerge/*' | sed 's#.*refs/heads/##' | head -n1)"
+          fi
+          if [ -n "$pending" ]; then
+            echo "::error::back-merge $pending pending — merge it, then update this branch (git merge origin/development or origin/main)."
+          else
+            echo "::error::This branch does not contain main. Merge origin/main into it (GIT-WORKFLOW.md release recipe)."
+          fi
+          exit 1
+
+  commitlint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24' # fleet baseline (ADR-046)
+
+      - name: Validate Conventional Commits on every commit in the PR
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          from="$BASE_SHA"
+          case "$HEAD_REF" in
+            backmerge/*)
+              echo "Back-merge of main: nothing to lint."
+              exit 0
+              ;;
+            release/* | hotfix/*)
+              if git rev-parse --verify --quiet origin/development > /dev/null; then
+                from="$(git merge-base origin/development "$HEAD_SHA")"
+                echo "release/hotfix head: linting only commits not already on development (from $from)."
+              fi
+              ;;
+          esac
+          # commitlint rejects --from == --to (exit 9).
+          if [ -z "$(git rev-list "$from..$HEAD_SHA")" ]; then
+            echo "No commits outside development to lint."
+            exit 0
+          fi
+          echo '{"extends":["@commitlint/config-conventional"]}' > /tmp/commitlint.config.json
+          npx --yes -p @commitlint/cli@21.2.2 -p @commitlint/config-conventional@21.2.2 \
+            commitlint --config /tmp/commitlint.config.json --from "$from" --to "$HEAD_SHA"
+
+  # The required check (context `gitflow-pr`). `always()` so a failed/cancelled upstream job turns
+  # this red instead of skipped (a skipped required check counts as passing).
+  gitflow-pr:
+    needs: [branch-rules, commitlint]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require branch-rules and commitlint
+        env:
+          BRANCH_RULES: ${{ needs.branch-rules.result }}
+          COMMITLINT: ${{ needs.commitlint.result }}
+        run: |
+          echo "branch-rules: $BRANCH_RULES, commitlint: $COMMITLINT"
+          [ "$BRANCH_RULES" = success ] && [ "$COMMITLINT" = success ]
+
+  auto-merge:
+    needs: branch-rules
+    # Ready PRs from this repository only (a fork PR gets no secrets anyway).
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      # `secrets` is not allowed in a step `if:`; the job env is.
+      HAS_APP: ${{ vars.FLEET_WRITER_APP_ID != '' && secrets.FLEET_WRITER_APP_PRIVATE_KEY != '' }}
+    steps:
+      - name: Mint the fleet-writer App token
+        id: app-token
+        if: env.HAS_APP == 'true'
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.FLEET_WRITER_APP_ID }}
+          private-key: ${{ secrets.FLEET_WRITER_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Enable auto-merge
+        if: env.HAS_APP == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # Merge commit on the release path (keeps ancestry), squash for everything else.
+          extra=()
+          case "$BASE_REF:$HEAD_REF" in
+            main:release/* | main:hotfix/*) method=merge ;;
+            development:backmerge/*)
+              # A back-merge is the backmerge/ head AND gitflow-main's marker in the body.
+              if ! grep -q '<!-- gitflow:backmerge ' <<< "$BODY"; then
+                echo "backmerge/ head without the gitflow-main marker: not an automatic back-merge, merge by hand."
+                exit 0
+              fi
+              # Same canonical subject/body gitflow-main sets: a push (conflict resolution) must
+              # not reset them. The source PR is the body's `Refs #n` line.
+              method=merge
+              refs="$(grep -m1 -oE '^Refs #[0-9]+' <<< "$BODY" || true)"
+              extra=(--subject "$TITLE (#$PR)" --body "$refs")
+              # Still conflicting: gitflow-main marked the body and alerted; the resolution push re-runs
+              # this. Mergeability is computed asynchronously (UNKNOWN until then).
+              for _ in $(seq 1 20); do
+                mergeable="$(gh pr view "$PR" -R "$REPO" --json mergeable -q .mergeable)"
+                [ "$mergeable" != UNKNOWN ] && break
+                sleep 3
+              done
+              if [ "$mergeable" = CONFLICTING ]; then
+                echo "Back-merge #$PR still conflicts: auto-merge waits for the resolution push."
+                exit 0
+              fi
+              if grep -q '^- Conflict: yes' <<< "$BODY"; then
+                awk '/^- Conflict: yes/ { print "- Conflict: resolved"; next } { print }' <<< "$BODY" > "$RUNNER_TEMP/body.md"
+                gh pr edit "$PR" -R "$REPO" --body-file "$RUNNER_TEMP/body.md" > /dev/null || true
+              fi
+              ;;
+            development:feature/* | development:fix/* | development:chore/* | development:docs/* | \
+            development:ci/* | development:renovate/*) method=squash ;;
+            *)
+              echo "No auto-merge rule for '$HEAD_REF' -> '$BASE_REF' (e.g. release/hotfix into development); merge by hand."
+              exit 0
+              ;;
+          esac
+          if gh pr merge "$PR" -R "$REPO" --auto "--$method" "${extra[@]}"; then
+            echo "Auto-merge (--$method) enabled on #$PR."
+            exit 0
+          fi
+          # GitHub refuses to enable auto-merge on a PR that is already mergeable ("clean status").
+          state="$(gh pr view "$PR" -R "$REPO" --json mergeStateStatus -q .mergeStateStatus)"
+          if [ "$state" = CLEAN ]; then
+            gh pr merge "$PR" -R "$REPO" "--$method" "${extra[@]}"
+            echo "#$PR was already mergeable: merged (--$method)."
+            exit 0
+          fi
+          echo "::error::Could not enable auto-merge on #$PR (merge state: $state)."
+          exit 1
+
+      - name: No App credentials
+        if: env.HAS_APP != 'true'
+        run: echo "::warning::vars.FLEET_WRITER_APP_ID/secrets.FLEET_WRITER_APP_PRIVATE_KEY are not available to this repo; auto-merge not enabled (docs ADR-060)."

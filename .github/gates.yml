@@ -5,7 +5,7 @@
 # orchestrator#211's classification (typecheck/unit/lint/contracts required;
 # e2e-real/chaos/perf/mutation advisory), or it bundles those into one job
 # (service-ci.yml's `validate`) or is the fleet's branch/commit policy gate
-# (gitflow-guard). gate-health re-measures every gate nightly (ADR-032 §2/§6) and opens
+# (gitflow-pr). gate-health re-measures every gate nightly (ADR-032 §2/§6) and opens
 # a gate-untrusted issue proposing demotion if one doesn't hold up -- this file does not
 # need to be perfect on day one.
 #
@@ -17,5 +17,5 @@
 # Regenerate with: python3 scripts/gen-gates-yml.py <repo> --check
 version: 1
 gates:
-  - check: "gitflow-guard / gitflow-guard / gitflow-guard"
+  - check: "gitflow-pr / gitflow-pr"
     since: 2026-10-07
